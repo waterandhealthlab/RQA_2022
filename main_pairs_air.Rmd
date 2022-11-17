@@ -1,0 +1,404 @@
+---
+title: "RQA analysis personal air temperature"
+author: "Nikolaos Efthymiou"
+date: "16/11/2022"
+output:
+  html_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r initialization, include=FALSE}
+rm(list = ls(all = TRUE)) # Clean Enviroment
+library(tidyverse)        # A collection of R packages designed for data science
+library(magrittr)         # A Forward-Pipe Operator for R
+library(knitr)            # A General-Purpose Package for Dynamic Report Generation in R
+library(readxl)           # Makes it easy to get data out of Excel and into R
+library(nonlinearTseries) # Nonlinear Time Series Analysis
+library(glue)             # Interpreted String Literals
+library(fs)               # Cross-Platform File System Operations Based on 'libuv'
+library(lubridate)        # Time related quirks
+library(factoextra)       # Extract and Visualize the Results of Multivariate Data Analyses
+library(FactoMineR)       # Multivariate Exploratory Data Analysis and Data Mining
+library(lmerTest)         # Tests in Linear Mixed Effects Models
+library(tidymodels)       # A collection of packages for modeling and statistical analysis
+library(broom.mixed)      # Tidying Methods for Mixed Models
+library(ggpubr)           # 'ggplot2' Based Publication Ready Plots
+library(formula.tools)    # Programmatic Utilities for Manipulating Formulas, Expressions, Calls, Assignments and Other R Objects
+library(lubridate)        # Time related quirks
+library(lvmisc)           # Veras Miscellaneous
+library(table1)           # An R package for generating tables of descriptive statistics in HTML.
+library(gridExtra)        # Miscellaneous Functions for "Grid" Graphics
+
+library(conflicted)  # An Alternative Conflict Resolution Strategy
+conflict_prefer("filter", "dplyr")
+conflict_prefer("lmer", "lmerTest")
+knitr::opts_chunk$set(echo=FALSE, warning = FALSE,message = FALSE, results='asis')
+# reproducible results
+set.seed(1)
+options(ggrepel.max.overlaps = Inf)
+```
+
+```{r load-data}
+basic <- read_delim("data/Recruitment Management Form-use in R.csv"       , show_col_types = FALSE)
+baseline <- read_delim("data/Demographics.csv"                            , show_col_types = FALSE) 
+chrono <- read_delim("data/Chronotype_Revised_Theo.csv"                   , show_col_types = FALSE) 
+code_setting <- read_delim("data/Recruitment Management Form-use in R.csv", show_col_types = FALSE) 
+
+# load measurements of adiponectin, cortisol, leptin, creatinine and sample types
+creatinine     <- read_delim("data/Creatinine results only - final.csv", show_col_types = FALSE)
+adiponectin    <- read_delim("data/adiponectin final meas.csv"         , show_col_types = FALSE) 
+leptin         <- read_delim("data/leptin final meas.csv"              , show_col_types = FALSE)
+cortisol       <- read_delim("data/cortisol final meas.csv"            , show_col_types = FALSE)
+SampleTypedata <- read_delim("data/samples.csv"                        , show_col_types = FALSE) 
+
+# read all csv files that contain "A". A means skin data
+temperature_measurements <- dir_ls("data/temperature data/", regexp = "A") %>% 
+  map(~quietly(read_delim)(.,show_col_types = FALSE, col_types  = "dcddddl")$result)
+```
+
+```{r data-modification}
+# FSSD to FMS
+SampleTypedata$SampleType %<>% {if_else(.=="FSSD","FMS",.)}
+
+# group: Urban-Rural=1 and Rural-Urban=2
+code_setting %<>% 
+  select(Code,Group) %>%
+  bind_rows(.,.) %>%
+  group_by(Code) %>%
+  transmute(Code_order=glue("{Code}-{1:2}"), setting=if_else(Group==1,c("Urban","Mountainous"),c("Mountainous","Urban"))) %>%
+  ungroup() %>%
+  select(!Code)
+
+measurements <- 
+  creatinine %>%                                         # creatinine measurments 
+  mutate(ID=glue("T{str_sub(ID)}"))                  %>% # add char T in front to match with other ID's ex. "65-2-3" -> "T65-2-3"
+  full_join(adiponectin   , by=c("ID"="sampleID"))   %>% # adiponectin measurments 
+  full_join(leptin        , by=c("ID"="sampleID"))   %>% # leptin measurments
+  full_join(cortisol      , by=c("ID"="sampleID"))   %>% # cortisol measurments
+  left_join(SampleTypedata, by=c("ID"="sampleID"))   %>% # sample type (First morning sample & Before sleep)
+  mutate(ID=str_sub(ID,1,5))                         %>% # drop sample number ex. "T65-2-3" -> "T65-2"
+  inner_join(code_setting , by=c("ID"="Code_order")) %>% # add setting (Mountainous-Urban)
+  mutate(ID=glue("{str_sub(ID,1,4)}{if_else(setting==\"Urban\",\"U\",\"M\")}")) %>% # include setting in the ID ex. "T10-1" -> "T10-1-U"
+  select(!setting) # drop setting 
+
+rm(creatinine,adiponectin,leptin,cortisol,SampleTypedata)
+```
+
+```{r temperature-data-filtering-and-loading}
+# file name as code
+names(temperature_measurements) %<>% str_match("T\\d\\d_A\\d") %>% {glue("{str_sub(.,1,3)}-{str_sub(.,6,6)}")}
+ 
+# drop T38 because of faulty biomarker measurments 
+keep    <- temperature_measurements %>% names() %>% str_sub(1,3) %>% table() %>% as_tibble() %>% filter(n==2 & !(. == "T38"))   %>% select(-n) %>% unlist()
+nokeep  <- temperature_measurements %>% names() %>% str_sub(1,3) %>% table() %>% as_tibble() %>% filter((n==1 & !(. == "T38"))) %>% select(-n) %>% unlist()
+keepall <- temperature_measurements %>% names() %>% str_sub(1,3) %>% table() %>% as_tibble()                                    %>% select(-n) %>% unlist()
+
+temperature_measurements <- temperature_measurements[temperature_measurements %>% names() %>% str_sub(1,3) %in% keep]
+total  <- length(temperature_measurements)
+
+cat(glue("<ul><b>Participants:</b>
+          <li>We have 106 temperature measurements</li>
+          <li>53 for skin and 53 for air temperature</li>
+          <li>In those 53 skin temperature files we have a total of {length(keepall)} participants</li>
+          <li>We drop {length(nokeep)} participants because they dont have temperature measurements in both settings ({length(keepall)-length(nokeep)} participants left) 
+          <li>We drop 1 participant because of invalid biomarker measurements ({length(keep)} participants left)</li></ul>"))
+
+temperature_measurements %<>% 
+  bind_rows(.id = "ID")          %>% # bind tibbles
+  select(c(ID,Temperature,Date)) %>% # keep only useful columns
+  na.omit()                          # drop na
+
+rm(total,nokeep,keepall)
+```
+
+```{r baseline-characteristics}
+baseline_characteristics <- basic %>% full_join(baseline, by="Code") %>% full_join(chrono, by="Code")
+
+baseline_characteristics %<>% select("Group","Code","Age","Height","Weight","Sex","education_level","Smoking_status",
+                          "alcohol_freq","Physical_exercise","screen_hours_day",
+                          "First_day_in_village", "Last_day_in_village","First_Sampling_day","Second_Sampling_day")
+
+# change variable types into factors
+baseline_characteristics %<>% mutate(across(c(Group,Sex,education_level,Smoking_status,alcohol_freq, 
+                                   Physical_exercise),~as_factor(.)))
+
+# change variable types into numeric
+baseline_characteristics %<>% mutate(across(Age,~as.numeric(.)))
+
+# format dates
+baseline_characteristics %<>% 
+  mutate(across(c("First_day_in_village", "Last_day_in_village", 
+                  "First_Sampling_day","Second_Sampling_day"),
+                ~as_date(., format="%d/%m/%Y")))
+
+# calculate BMI
+baseline_characteristics %<>% mutate(BMI = bmi(Weight,(Height/100)))
+
+# create BMI categories: 
+# underweight under 18.5 kg/m2, normal weight: 18.5 to 25, overweight: 25 to 30
+baseline_characteristics %<>% 
+  mutate(BMIcat = cut(BMI,
+                      breaks=c(-Inf, 18.5, 25, +Inf),
+                      labels=c("underweight","normal weight","overweight")))
+
+# revalue categorical variables to their actual values: 
+baseline_characteristics$Group %<>% recode_factor("1"="First urban", "2"="First mountainous")
+
+baseline_characteristics$education_level %<>% recode_factor( "2"="Secondary", 
+                                                  "3"="University/college", 
+                                                  "4"="Master/PhD")
+
+baseline_characteristics$Smoking_status %<>% recode_factor("1"="Smoker", 
+                                                "2"="Non-smoker", 
+                                                "3"="Former smoker")
+
+baseline_characteristics$alcohol_freq %<>% recode_factor("2"="Weekly",
+                                            "3"="Monthly",
+                                            "4"="Rarely/Never")
+
+baseline_characteristics$Physical_exercise %<>% recode_factor("1"="Yes", "2"="No")
+
+baseline_characteristics$Sex %<>% recode_factor("1"="Female", "2"="Male")
+
+# calculate washout period based on group 
+# for Group 2: use of 5 days in order to account the 5-day min stay in urban setting
+baseline_characteristics %<>% mutate(washout_days = as.numeric(if_else(Group=="First mountainous",
+                                                                       Second_Sampling_day - 5 - Last_day_in_village,
+                                                                       First_day_in_village - First_Sampling_day)))
+
+# calculate days in village based on group 
+baseline_characteristics %<>% mutate(days_mountain = as.numeric(if_else(Group=="First mountainous",
+                                                                        First_Sampling_day - First_day_in_village,
+                                                                        Second_Sampling_day - First_day_in_village)))
+
+baseline_characteristics %<>% select(!c(First_Sampling_day,First_day_in_village,Second_Sampling_day,Last_day_in_village))
+
+# keep only the codes we using for the analysis
+baseline_characteristics %<>% filter(Code %in% (temperature_measurements$ID %>% str_sub(1,3)))
+
+pvalue <- function(x, ...) {
+    # Construct vectors of data y, and groups (strata) g
+    x <- x[c(1,2)] # drop ovreall
+    y <- unlist(x)
+    g <- factor(rep(1:length(x), times=sapply(x, length)))
+    if (is.numeric(y)) {
+        # For numeric variables, perform a standard 2-sample t-test
+        p <- t.test(y ~ g)$p.value
+    } else {
+        # For categorical variables, perform a fisher test of independence
+        p <- fisher.test(table(y, g))$p.value
+    }
+    # Format the p-value, using an HTML entity for the less-than sign.
+    # The initial empty string places the output on the line below the variable label.
+    c("", sub("<", "&lt;", format.pval(p, digits=3, eps=0.001)))
+}
+
+table1(~ Age + Sex + BMI + BMIcat + education_level + Smoking_status + alcohol_freq +
+         Physical_exercise + screen_hours_day + days_mountain + washout_days | Group,
+         data = baseline_characteristics , extra.col=list(`P-value`=pvalue))
+
+rm(basic,chrono,baseline,pvalue)
+```
+
+```{r temperature-data-pre-processing}
+temperature_measurements %<>% 
+  inner_join(code_setting, by=c("ID"="Code_order"))                             %>% # add setting column
+  mutate(ID=glue("{str_sub(ID,1,4)}{if_else(setting==\"Urban\",\"U\",\"M\")}")) %>% # fix id so it contains setting information
+  arrange(desc(setting))                                                        %>% # short by setting
+  mutate(ID=as_factor(ID), setting=as_factor(setting))                          %>% # ID as factor
+  mutate(Date=dmy_hm(Date))                                                     %>% # fix date format
+  na.omit()
+
+rm(code_setting)
+```
+
+```{r temperature-plots}
+p1 <-temperature_measurements %>%
+  filter(setting=="Urban") %>%
+  ggplot(aes(x=hour(Date),y=Temperature)) + 
+  facet_wrap(vars(ID)) + 
+  geom_line() + 
+  ggtitle("Temperature plots Urban") +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+p2 <-temperature_measurements %>% 
+  filter(setting=="Mountainous") %>%
+  ggplot(aes(x=hour(Date),y=Temperature)) + 
+  facet_wrap(vars(ID)) + 
+  geom_line() + 
+  ggtitle("Temperature plots Mountainous") +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+ggarrange(p1,p2)
+rm(p1,p2)
+```
+
+```{r rqa}
+rqa_rad <- 0.1
+
+rqa_measurements <-
+  temperature_measurements %>%
+  group_by(ID,setting) %>% 
+  summarise(rqa(time.series = Temperature, time.lag = 1, radius = rqa_rad, embedding.dim=2)[2:13] %>% as_tibble(), .groups = "keep") %>% 
+  ungroup() %>%
+  select(!c(Lmax,Vmax,LmeanWithoutMain,RATIO))
+
+kable(rqa_measurements, caption = glue("RQA analysis Settings: time.lag=1, radius = {rqa_rad}"))
+```
+## RQA Plots
+```{r generate-rqa-plots, include=FALSE, eval=TRUE}
+i <- 1
+plots <- list()
+
+for (participant in keep) {
+  myrqadataU <- temperature_measurements %>% filter(ID==glue("{participant}-U")) %>% mutate(observations = 1:n())
+  myrqadataM <- temperature_measurements %>% filter(ID==glue("{participant}-M")) %>% mutate(observations = 1:n())
+  
+  maxU <- max(myrqadataU$observations)
+  maxM <- max(myrqadataM$observations)
+  
+  p1 <- recurrencePlot(time.series = myrqadataU$Temperature, time.lag = 1, 
+                       radius = rqa_rad, embedding.dim = 2, main=glue("{participant} Urban"),
+                       scales = list(y = list(at = myrqadataU$observations[c(maxU-2,maxU %/% 2, 1)], 
+                                              label = myrqadataU$Date[c(maxU-2,maxU %/% 2,1)]),
+                                     x = list(at = myrqadataU$observations[c(1,maxU %/% 2,maxU-2)], 
+                                              label = myrqadataU %$% glue("{hour(Date)}:{minute(Date)}")[c(1,maxU %/% 2,maxU-2)])),
+                       ylab="",xlab="", plot=FALSE)
+
+  plots[[i]] <- p1
+  i <- i + 1
+  
+  p2 <- recurrencePlot(time.series = myrqadataM$Temperature, time.lag = 1, 
+                       radius = rqa_rad, embedding.dim = 2, main=glue("{participant} Mountainous"),
+                       scales = list(y = list(at = myrqadataM$observations[c(maxM-2,maxM %/% 2, 1)], 
+                                              label = myrqadataM$Date[c(maxU-2,maxM %/% 2,1)]),
+                                     x = list(at = myrqadataM$observations[c(1,maxM %/% 2,maxM-2)], 
+                                              label = myrqadataM %$% glue("{hour(Date)}:{minute(Date)}")[c(1,maxM %/% 2,maxM-2)])),
+                       ylab="",xlab="")
+
+  plots[[i]] <- p2
+  i <- i + 1
+}
+```
+
+```{r plot-rqa-plots, eval=TRUE}
+for (i in seq(1,length(plots),2)) {
+  grid.arrange(plots[[i]],plots[[i+1]], ncol=2,widths = c(20,20))
+}
+```
+<br>
+```{r clean-up}
+rm(plots,i,p1,p2,maxM,maxU,rqa_rad,participant,myrqadataM,myrqadataU,keep,temperature_measurements)
+```
+## PCA analysis
+```{r pca-analysis}
+res_pca <- PCA(rqa_measurements %>% select(!setting) %>% column_to_rownames("ID"), graph = FALSE)
+kable(get_eig(res_pca), caption = "Eigenvalues/variances")
+
+fviz_screeplot(res_pca, addlabels = TRUE, ylim = c(0, 50))
+
+kable(res_pca$var$coord,   caption = "Coordinates of variables")
+kable(res_pca$var$contrib, caption = "Contribution of variables")
+
+fviz_pca_var(res_pca, col.var="contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE)
+
+# Contributions of variables to PC1
+fviz_contrib(res_pca, choice = "var", axes = 1, top = 10)
+# Contributions of variables to PC2
+fviz_contrib(res_pca, choice = "var", axes = 2, top = 10)
+# Extract the results for individuals
+
+fviz_pca_ind(res_pca, col.ind = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE ,# Avoid text overlapping (slow if many points)
+             title = "Quality of the individuals on the factor map")
+
+fviz_pca_ind(res_pca,
+             label = "none", # hide individual labels
+             habillage = rqa_measurements$setting, # color by groups
+             palette = c("#00AFBB", "#E7B800", "#FC4E07"),
+             addEllipses = TRUE # Concentration ellipses
+)
+```
+## RQA descriptives Overall and by setting
+```{r rqa-descriptives}
+# add dim1 dim2
+model_data <- rqa_measurements %>% inner_join(res_pca$ind$coord %>% as_tibble(rownames = NA) %>% rownames_to_column("ID") %>% select(ID,Dim.1,Dim.2), by="ID")
+
+model_data %>% bind_rows(model_data %>% mutate(setting="Overall")) %>%
+  select(!ID) %>% pivot_longer(!setting , names_to = "metric", values_to = "value") %>% group_by(metric,setting) %>%
+  summarise(mean = mean(value),
+            sd   = sd(value)  ,
+            q0   = quantile(value,0),
+            q25  = quantile(value,.25),
+            q50  = quantile(value,.50),
+            q75  = quantile(value,.75),
+            q90  = quantile(value,.90),
+            q95  = quantile(value,.95),
+            q100 = quantile(value,1), .groups = "keep") %>% kable()
+
+rm(res_pca,rqa_measurements)
+```
+## Paired T test after log transformation for each variable for the 2 groups (alternative hypothesis: true difference in means is not equal to 0)
+```{r paired-t-test}
+kable(model_data %>%
+  select_if(is.numeric) %>%
+  select(!`Dim.2`) %>%
+  mutate(across(REC:Vmean, ~log1p(.)),`Dim.1` = log1p(`Dim.1` + abs(min(`Dim.1`)))) %>%
+  map_df(~ broom::tidy(t.test(. ~ model_data$setting, paired = TRUE) ), .id = 'metric'), caption = "Paired - T test")
+```
+## Leptin,cortisol and adiponectin are adjusted for creatinine and then log transformed (Metrics are log transformed in a previous step)
+```{r model-data-log}
+measurements$creatinine %<>% {if_else(.<0,0.1,.)}
+measurements %<>% mutate(across(!c(ID,creatinine, SampleType),~log1p(./creatinine))) %>% select(!creatinine)
+model_data %<>% mutate(across(REC:Vmean, ~log1p(.)),`Dim.1` = log1p(`Dim.1` + abs(min(`Dim.1`)))) %>% select(!`Dim.2`)
+
+model_data %<>% 
+  inner_join(measurements, by=c("ID")) %>% 
+  mutate(across(!c(ID,setting,SampleType),~scale(.)[TRUE])) %>% 
+  ungroup() %>%
+  mutate(ID=str_sub(ID,1,3)) %>%
+  right_join(baseline_characteristics %>% select(Code,Age,Sex),by=c("ID"="Code")) %>%
+  pivot_longer(REC:`Dim.1`, names_to="MesurmentName",values_to="Mesurment") %>%
+  nest_by(MesurmentName)
+```
+## Leptin models
+```{r leptin-models-log}
+model_formula <- as.formula(leptin ~ Mesurment + SampleType + Age + (1|ID))
+print(glue("##### Formula:{as.character(model_formula)} <br> Number of observations:{nobs(lmer(model_formula, data=model_data$data[[1]]))}"))
+model_leptin <- model_data %>% summarise(tidy(lmer(model_formula, data=data),conf.int=TRUE),.groups="keep") %>% ungroup()
+model_leptin %<>% filter(term=="Mesurment")  %>% arrange(p.value)
+kable(model_leptin %>% select(!group), caption = "p.values values for Metabolites (14 total models)")
+```
+## Adiponectin models
+```{r adiponectin-models-log}
+# adiponectin models
+model_formula <- as.formula(adiponectin ~ Mesurment + SampleType + Age + (1|ID))
+print(glue("##### Formula:{as.character(model_formula)} <br> Number of observations:{nobs(lmer(model_formula, data=model_data$data[[1]]))}"))
+model_adiponectin <- model_data %>% summarise(tidy(lmer(model_formula, data=data),conf.int=TRUE),.groups="keep") %>% ungroup()
+model_adiponectin %<>% filter(term=="Mesurment") %>% arrange(p.value)
+kable(model_adiponectin %>% select(!group), caption = "p.values values for Metabolites (14 total models)")
+```
+## Cortisol models
+```{r cortisol-models-log}
+model_formula <- as.formula(cortisol ~ Mesurment + SampleType + Age + (1|ID))
+print(glue("##### Formula:{as.character(model_formula)} <br> Number of observations:{nobs(lmer(model_formula, data=model_data$data[[1]]))}"))
+model_cortisol <- model_data %>% summarise(tidy(lmer(model_formula, data=data),conf.int=TRUE),.groups="keep") %>% ungroup()
+model_cortisol %<>% filter(term=="Mesurment") %>% arrange(p.value)
+kable(model_cortisol %>% select(!group), caption = "p.values values for Metabolites (14 total models)")
+```
+## Metrics ~ setting models
+```{r metrics-models}
+model_formula <- as.formula(Mesurment ~ setting + Age + Sex)
+print(glue("##### Formula:{as.character(model_formula)} <br> Number of observations:{nobs(lm(model_formula, data=model_data$data[[1]]))}"))
+model_metrics <- model_data %>% summarise(tidy(glm(model_formula, data=data),conf.int=TRUE),.groups="keep") %>% ungroup()
+model_metrics %<>% filter(str_detect(term,"setting")) %>% arrange(p.value)
+kable((model_metrics))
+```
